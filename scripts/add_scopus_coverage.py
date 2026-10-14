@@ -123,6 +123,35 @@ def main() -> None:
 
     db["ISSN"] = clean_issn(db["ISSN"])
     db["EISSN"] = clean_issn(db["EISSN"])
+
+    # The marker inside a name, left by an earlier run of update_sjr.py.
+    #
+    # `load_scimago` strips "(discontinued)" from the title now, because a
+    # record whose venue is the plain name has to match the row. These rows
+    # were appended before it did, and they are in the committed database:
+    # `lookup_journal("AgBioForum")` finds nothing, and so does
+    # "American Journal of Health Behavior" (publication-web DATA-18).
+    #
+    # Stripping changes the normalised key, so a row whose plain name is
+    # already in the database becomes a duplicate. The marker row is the
+    # poorer of the two — appended from SCImago, no impact factor — so it
+    # is the one that goes.
+    marked = db["Name"].fillna("").str.contains("(discontinued)", case=False,
+                                                regex=False)
+    if marked.any():
+        db.loc[marked, "Name"] = db.loc[marked, "Name"].str.replace(
+            r"\s*\(discontinued\)\s*", " ", case=False, regex=True
+        ).str.strip()
+        db.loc[marked, "Scopus_Discontinued"] = True
+        plain = set(db.loc[~marked, "Name"].fillna("").map(
+            normalize_journal_name))
+        now_duplicate = marked & db["Name"].map(
+            normalize_journal_name).isin(plain)
+        print(f"stripping the marker from {int(marked.sum())} names, "
+              f"dropping {int(now_duplicate.sum())} that the plain name "
+              f"already answers")
+        db = db[~now_duplicate].reset_index(drop=True)
+
     db["Normalized Journal"] = db["Name"].map(normalize_journal_name)
 
     matched = 0
