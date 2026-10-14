@@ -46,7 +46,8 @@ from update_jif import PROCESSED, RAW, REPORTS, clean_issn, iso4_fallback, \
     normalize_journal_name
 from update_sjr import SJR_COLS, hyphen_issn, load_scimago
 
-SCOPUS_COLS = ["Scopus_Type", "Scopus_Coverage", "Scopus_Edition"]
+SCOPUS_COLS = ["Scopus_Type", "Scopus_Coverage", "Scopus_Edition",
+               "Scopus_Discontinued"]
 
 
 def main() -> None:
@@ -88,6 +89,17 @@ def main() -> None:
 
     # Newest last, so a source present in several editions keeps the newest
     # row — and one only an older edition knows is still here.
+    #
+    # The review of PR #111 asked for the *longest* coverage instead, on the
+    # ground that a file states coverage as of its download date rather than
+    # its edition year. Refused, and measured before refusing: across the
+    # three editions exactly **4** sources have a newest-edition coverage
+    # that ends earlier than an older edition's, all four by one year
+    # (2022 against 2023), and nothing says which of the two statements
+    # SCImago corrected. With the coverage years now outranking the SJR
+    # score (D15), an extra year is a false claim of the kind the owner has
+    # just confirmed in his own export, while a missing one is a claim not
+    # made. So the newest edition's statement stands.
     sc = pd.concat(frames, ignore_index=True)
     sc = sc.drop_duplicates("Sourceid", keep="last").reset_index(drop=True)
     print(f"union of {len(editions)} edition(s): {len(sc)} sources")
@@ -130,9 +142,43 @@ def main() -> None:
         for c in SCOPUS_COLS:
             db.at[idx, c] = r[c]
 
+    # The abbreviations an earlier run invented, cleared where they do harm.
+    #
+    # `update_sjr.py` used to give every Scopus-only source it appended an
+    # ISO-4 guess at its abbreviation, and those rows are in the committed
+    # database. The guess collides with the row the same journal already has
+    # under its Web of Science name — and sometimes with a different journal
+    # altogether: `algal res.` names both Algal Research (JIF 5.0) and an
+    # appended duplicate, and `appl. econ.` names APPLIED ECONOMICS (JIF
+    # 2.6) and Applied Econometrics. An ambiguous abbreviation yields no
+    # metrics at all (Issue #10, I5), so the guess costs a journal the
+    # impact factor that is really its own.
+    #
+    # Cleared where both hold: the row has no impact factor, so no JCR
+    # edition ever named it, and its abbreviation is exactly the guess its
+    # own title produces, so nothing was looked up to get it. 9,743 rows
+    # answer to that, and 70 ambiguous abbreviations go with them. The
+    # sources stay findable by name, which is how a reader meets them.
+    guess = db["Name"].fillna("").map(iso4_fallback).fillna("")
+    have   = db["Journal_Abbreviation"].fillna("")
+    no_jif = db["JIF"].isna() | (db["JIF"].astype(str).str.strip() == "")
+    invented = no_jif & (have != "") & (
+        have.str.strip().str.lower() == guess.str.strip().str.lower())
+    print(f"clearing {int(invented.sum())} invented abbreviations "
+          f"(no impact factor, abbreviation is the ISO-4 guess)")
+    db.loc[invented, "Journal_Abbreviation"] = None
+
     # Every type this time, not only "journal" — that filter is the defect.
     new_rows = []
     missing = sc[~sc.index.isin(used)]
+    # The other half of DATA-4, and this one is real. A title can name two
+    # sources under two `Sourceid`s — a reissue, a change of publisher — and
+    # the duplicate drop below keeps the *first* row, which in edition order
+    # is the oldest file's. 17 titles are in that position and in every one
+    # the newest edition covers further, so the append was handing out the
+    # shorter coverage. Newest first here, so `keep="first"` keeps it.
+    missing = missing.sort_values("Scopus_Edition", ascending=False,
+                                  kind="stable")
     for i, r in missing.iterrows():
         issns = r["issns"]
         row = {c: None for c in db.columns}
@@ -141,7 +187,10 @@ def main() -> None:
             "ISSN": issns[0] if issns else "",
             "EISSN": issns[1] if len(issns) > 1 else "",
             "Normalized Journal": r["norm"],
-            "Journal_Abbreviation": iso4_fallback(r["Title"]),
+            # No `Journal_Abbreviation`: see update_sjr.py. The ISO-4 guess
+            # collides with the row the same journal already has under its
+            # Web of Science name, and an ambiguous abbreviation yields no
+            # metrics at all (DATA-5, DATA-6, Issue #10).
             "SJR_Year": float(year),
             "Scopus_Type": r["Scopus_Type"],
             "Scopus_Coverage": r["Scopus_Coverage"],

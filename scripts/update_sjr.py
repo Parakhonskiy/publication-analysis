@@ -37,12 +37,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from update_jif import normalize_journal_name, iso4_fallback, clean_issn, PROCESSED, RAW, REPORTS
+from update_jif import normalize_journal_name, clean_issn, PROCESSED, RAW, REPORTS
 
 SJR_COLS = ["SJR_Score", "SJR_Quartile", "H_Index", "SJR_Categories", "SJR_Areas"]
 # Not SJR values but Scopus facts, so they are refreshed every edition and
 # never shifted into a history column.
-SCOPUS_COLS = ["Scopus_Type", "Scopus_Coverage"]
+SCOPUS_COLS = ["Scopus_Type", "Scopus_Coverage", "Scopus_Discontinued"]
 
 
 def _num(v) -> float | None:
@@ -62,6 +62,24 @@ def hyphen_issn(raw: str) -> str:
 
 def load_scimago(path: Path) -> pd.DataFrame:
     sc = pd.read_csv(path, sep=";", dtype=str)
+    # SCImago appends "(discontinued)" to a source it has stopped listing.
+    # That is a status, not part of the name, and leaving it in means a
+    # record whose venue is the plain title matches nothing: a paper in IOP
+    # Conference Series: Materials Science and Engineering found the row only
+    # by ISSN, and not at all without one. 328 rows carry the marker.
+    #
+    # This used to say the fact was not lost because the coverage years say
+    # when it ended. An independent review of PR #111 showed that is false,
+    # and the measurement settles it: of the 132 sources the 2025 file marks
+    # discontinued, **all 132** have coverage ending 2025 or later, and
+    # publication-web reads a range reaching the newest edition's own year
+    # as open at the top — a snapshot of something still being covered. So
+    # each of them claimed 2026 and every year after it. The status is
+    # carried in a column of its own now (DATA-1).
+    sc["Scopus_Discontinued"] = sc["Title"].fillna("").str.contains(
+        "(discontinued)", case=False, regex=False)
+    sc["Title"] = sc["Title"].fillna("").str.replace(
+        r"\s*\(discontinued\)\s*$", "", regex=True).str.strip()
     sc = sc.rename(columns={"SJR Best Quartile": "SJR_Quartile", "H index": "H_Index",
                             "Categories": "SJR_Categories", "Areas": "SJR_Areas"})
     sc["SJR_Score"] = sc["SJR"].map(_num)
@@ -157,9 +175,20 @@ def main() -> None:
         for i, r in sc[~sc.index.isin(used)].iterrows():
             row = {c: None for c in db.columns}
             issns = r["issns"]
+                # No `Journal_Abbreviation`. The ISO-4 fallback guesses one
+                # from the title, and for an appended source the guess
+                # collides with the row the same journal already has under
+                # its Web of Science name: 106 abbreviations in the built
+                # database are ambiguous for exactly that reason, `phys.
+                # rep.` among them, naming both PHYSICS REPORTS (JIF 27.5)
+                # and this file's "Physics Reports". An ambiguous
+                # abbreviation yields no metrics at all (Issue #10, I5), so
+                # the guess costs the journal its real impact factor and
+                # buys nothing: a reader who types the appended source's
+                # name finds it by name (DATA-5, DATA-6).
             row.update({
                 "Name": r["Title"], "ISSN": issns[0] if issns else "", "EISSN": issns[1] if len(issns) > 1 else "",
-                "Normalized Journal": r["norm"], "Journal_Abbreviation": iso4_fallback(r["Title"]),
+                "Normalized Journal": r["norm"],
                 "SJR_Year": float(year),
             })
             for c in SJR_COLS + SCOPUS_COLS:
