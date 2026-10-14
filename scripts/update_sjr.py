@@ -16,9 +16,12 @@ What it does
      SJR_Categories, SJR_Areas  and sets  SJR_Year; the previous score and
      quartile are kept in  SJR_Score_<old year> / SJR_Quartile_<old year>.
      Unmatched rows keep their old values (SJR_Year stays old).
-  4. Appends SCImago sources of type "journal" that are not in the DB yet
-     (Scopus-only journals — no JIF, but the web app can then flag them as
-     Scopus-indexed).  Skip with --no-append.
+  4. Appends every SCImago source that is not in the DB yet, whatever its
+     type — journals, book series, conference proceedings, trade journals.
+     They carry no JIF, and often no SJR either, but the app can then say
+     that Scopus covers them and for which years.  Skip with --no-append.
+  4b. Records Scopus_Type and Scopus_Coverage for every matched source. The
+     coverage string is kept verbatim, gaps included.
   5. Writes the DB and a change report to reports/sjr_update_<year>.md.
 
 The SCImago year is taken from --sjr-year or parsed from the file name
@@ -37,6 +40,9 @@ import pandas as pd
 from update_jif import normalize_journal_name, iso4_fallback, clean_issn, PROCESSED, RAW, REPORTS
 
 SJR_COLS = ["SJR_Score", "SJR_Quartile", "H_Index", "SJR_Categories", "SJR_Areas"]
+# Not SJR values but Scopus facts, so they are refreshed every edition and
+# never shifted into a history column.
+SCOPUS_COLS = ["Scopus_Type", "Scopus_Coverage"]
 
 
 def _num(v) -> float | None:
@@ -63,6 +69,12 @@ def load_scimago(path: Path) -> pd.DataFrame:
     sc["SJR_Quartile"] = sc["SJR_Quartile"].where(sc["SJR_Quartile"].isin(["Q1", "Q2", "Q3", "Q4"]), None)
     sc["issns"] = sc["Issn"].fillna("").map(lambda s: [hyphen_issn(x) for x in s.split(",") if x.strip()])
     sc["norm"]  = sc["Title"].map(normalize_journal_name)
+    # The source's kind and the years Scopus covers it. The coverage string
+    # is kept verbatim, gaps included ("1974, 1977-1985, 1990-1991,
+    # 1994-2026"): 7,625 of the sources have them, and a first-and-last-year
+    # pair would claim years Scopus does not cover.
+    sc["Scopus_Type"]     = sc["Type"]
+    sc["Scopus_Coverage"] = sc["Coverage"].fillna("").map(lambda s: str(s).strip())
     return sc
 
 
@@ -123,16 +135,26 @@ def main() -> None:
             continue
         used.add(i)
         r = sc.loc[i]
-        for c in SJR_COLS:
+        for c in SJR_COLS + SCOPUS_COLS:
             db.at[idx, c] = r[c]
         db.at[idx, "SJR_Year"] = float(year)
         if not a and r["issns"]:
             db.at[idx, "ISSN"] = r["issns"][0]
 
-    # Scopus-only journals → append
+    # Sources Scopus indexes that the database does not have → append.
+    #
+    # This used to take `Type == "journal"` only, and that was the defect
+    # behind publication-web issue #109: the 2025 export holds 913 book
+    # series, 688 conference proceedings and 180 trade journals, every one
+    # of them indexed by Scopus with its coverage years filled in, and none
+    # of them reached us. A conference series two of a pilot participant's
+    # papers appeared in was simply absent, so the app reported fewer Scopus
+    # papers than Scopus. An SJR or a quartile stays absent where SCImago
+    # leaves it absent — proceedings carry no quartile, and that is the
+    # right answer rather than a missing one.
     new_rows = []
     if not args.no_append:
-        for i, r in sc[(sc["Type"] == "journal") & (~sc.index.isin(used))].iterrows():
+        for i, r in sc[~sc.index.isin(used)].iterrows():
             row = {c: None for c in db.columns}
             issns = r["issns"]
             row.update({
@@ -140,7 +162,7 @@ def main() -> None:
                 "Normalized Journal": r["norm"], "Journal_Abbreviation": iso4_fallback(r["Title"]),
                 "SJR_Year": float(year),
             })
-            for c in SJR_COLS:
+            for c in SJR_COLS + SCOPUS_COLS:
                 row[c] = r[c]
             new_rows.append(row)
         if new_rows:
